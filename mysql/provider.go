@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net"
@@ -17,20 +18,23 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/helper/validation"
 	"github.com/hashicorp/terraform-plugin-sdk/terraform"
 
+	"github.com/Azure/go-autorest/autorest/azure/auth"
+
 	"golang.org/x/net/proxy"
 )
 
 const (
 	cleartextPasswords = "cleartext"
 	nativePasswords    = "native"
+	aadAuthentication  = "aad_auth"
 )
 
 type MySQLConfiguration struct {
-	Config                 *mysql.Config
-	MaxConnLifetime        time.Duration
-	MaxOpenConns           int
-	ConnectRetryTimeoutSec time.Duration
-	db                     *sql.DB
+	Config              *mysql.Config
+	MaxConnLifetime     time.Duration
+	MaxOpenConns        int
+	ConnectRetryTimeout time.Duration
+	db                  *sql.DB
 }
 
 func (c *MySQLConfiguration) GetDbConn() (*sql.DB, error) {
@@ -54,7 +58,7 @@ func Provider() terraform.ResourceProvider {
 				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
 					value := v.(string)
 					if value == "" {
-						errors = append(errors, fmt.Errorf("Endpoint must not be an empty string"))
+						errors = append(errors, fmt.Errorf("endpoint must not be an empty string"))
 					}
 
 					return
@@ -80,7 +84,7 @@ func Provider() terraform.ResourceProvider {
 					"ALL_PROXY",
 					"all_proxy",
 				}, nil),
-				ValidateFunc: validation.StringMatch(regexp.MustCompile("^socks5h?://.*:\\d+$"), "The proxy URL is not a valid socks url."),
+				ValidateFunc: validation.StringMatch(regexp.MustCompile(`^socks5h?://.*:\d+$`), "The proxy URL is not a valid socks url."),
 			},
 
 			"tls": {
@@ -108,7 +112,20 @@ func Provider() terraform.ResourceProvider {
 				Type:         schema.TypeString,
 				Optional:     true,
 				Default:      nativePasswords,
-				ValidateFunc: validation.StringInSlice([]string{cleartextPasswords, nativePasswords}, true),
+				ValidateFunc: validation.StringInSlice([]string{cleartextPasswords, nativePasswords, aadAuthentication}, true),
+			},
+
+			"aad_auth_client_id": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Description:  "Azure AD Client ID, required when using AAD Auth Plugin",
+				ValidateFunc: validation.StringIsNotEmpty,
+			},
+
+			"aad_auth_tenant_id": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Azure AD Client ID, required when using AAD Auth Plugin",
 			},
 
 			"connect_retry_timeout_sec": {
@@ -144,14 +161,26 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 		proto = "unix"
 	}
 
+	var authPlugin = d.Get("authentication_plugin").(string)
+	var password = d.Get("password").(string)
+
+	if authPlugin == aadAuthentication {
+		authPlugin = cleartextPasswords
+		token, err := getAADToken(d, password)
+		if err != nil {
+			return nil, err
+		}
+		password = token
+	}
+
 	conf := mysql.Config{
 		User:                    d.Get("username").(string),
-		Passwd:                  d.Get("password").(string),
+		Passwd:                  password,
 		Net:                     proto,
 		Addr:                    endpoint,
 		TLSConfig:               d.Get("tls").(string),
-		AllowNativePasswords:    d.Get("authentication_plugin").(string) == nativePasswords,
-		AllowCleartextPasswords: d.Get("authentication_plugin").(string) == cleartextPasswords,
+		AllowNativePasswords:    authPlugin == nativePasswords,
+		AllowCleartextPasswords: authPlugin == cleartextPasswords,
 	}
 
 	dialer, err := makeDialer(d)
@@ -159,19 +188,40 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 		return nil, err
 	}
 
-	mysql.RegisterDial("tcp", func(network string) (net.Conn, error) {
-		return dialer.Dial("tcp", network)
+	mysql.RegisterDialContext("tcp", func(ctx context.Context, addr string) (net.Conn, error) {
+		return dialer.Dial("tcp", addr)
 	})
 
 	mysqlConf := &MySQLConfiguration{
-		Config:                 &conf,
-		MaxConnLifetime:        time.Duration(d.Get("max_conn_lifetime_sec").(int)) * time.Second,
-		MaxOpenConns:           d.Get("max_open_conns").(int),
-		ConnectRetryTimeoutSec: time.Duration(d.Get("connect_retry_timeout_sec").(int)) * time.Second,
-		db:                     nil,
+		Config:              &conf,
+		MaxConnLifetime:     time.Duration(d.Get("max_conn_lifetime_sec").(int)) * time.Second,
+		MaxOpenConns:        d.Get("max_open_conns").(int),
+		ConnectRetryTimeout: time.Duration(d.Get("connect_retry_timeout_sec").(int)) * time.Second,
+		db:                  nil,
 	}
 
 	return mysqlConf, nil
+}
+
+func getAADToken(d *schema.ResourceData, password string) (token string, err error) {
+	clientId, exists := d.GetOk("aad_auth_client_id")
+	if !exists {
+		err = fmt.Errorf("aad_auth_client_id is not set and is required when authentication_plugin is aad_auth")
+		return
+	}
+	tenantId, exists := d.GetOk("aad_auth_tenant_id")
+	if !exists {
+		err = fmt.Errorf("aad_auth_tenant_id is not set and is required when authentication_plugin is aad_auth")
+		return
+	}
+	clientCredentialsConfig := auth.NewClientCredentialsConfig(clientId.(string), password, tenantId.(string))
+	clientCredentialsConfig.AADEndpoint = "https://ossrdbms-aad.database.windows.net/.default"
+	aadToken, err := clientCredentialsConfig.ServicePrincipalToken()
+	if err != nil {
+		return
+	}
+	token = aadToken.Token().AccessToken
+	return
 }
 
 var identQuoteReplacer = strings.NewReplacer("`", "``")
@@ -230,7 +280,7 @@ func connectToMySQL(conf *MySQLConfiguration) (*sql.DB, error) {
 	// when Terraform thinks it's available and when it is actually available.
 	// This is particularly acute when provisioning a server and then immediately
 	// trying to provision a database on it.
-	retryError := resource.Retry(conf.ConnectRetryTimeoutSec, func() *resource.RetryError {
+	retryError := resource.Retry(conf.ConnectRetryTimeout, func() *resource.RetryError {
 		db, err = sql.Open("mysql", dsn)
 		if err != nil {
 			return resource.RetryableError(err)
@@ -245,7 +295,7 @@ func connectToMySQL(conf *MySQLConfiguration) (*sql.DB, error) {
 	})
 
 	if retryError != nil {
-		return nil, fmt.Errorf("Could not connect to server: %s", retryError)
+		return nil, fmt.Errorf("could not connect to server: %s", retryError)
 	}
 	db.SetConnMaxLifetime(conf.MaxConnLifetime)
 	db.SetMaxOpenConns(conf.MaxOpenConns)

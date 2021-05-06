@@ -162,7 +162,7 @@ func UpdateUser(d *schema.ResourceData, meta interface{}) error {
 		/* ALTER USER syntax introduced in MySQL 5.7.6 deprecates SET PASSWORD (GH-8230) */
 		serverVersion, err := serverVersion(db)
 		if err != nil {
-			return fmt.Errorf("Could not determine server version: %s", err)
+			return fmt.Errorf("could not determine server version: %s", err)
 		}
 
 		ver, _ := version.NewVersion("5.7.6")
@@ -192,9 +192,7 @@ func UpdateUser(d *schema.ResourceData, meta interface{}) error {
 	}
 
 	if d.HasChange("tls_option") && currentVersion.GreaterThan(requiredVersion) {
-		var stmtSQL string
-
-		stmtSQL = fmt.Sprintf("ALTER USER '%s'@'%s'  REQUIRE %s",
+		var stmtSQL = fmt.Sprintf("ALTER USER '%s'@'%s'  REQUIRE %s",
 			d.Get("user").(string),
 			d.Get("host").(string),
 			fmt.Sprintf(" REQUIRE %s", d.Get("tls_option").(string)))
