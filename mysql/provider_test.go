@@ -4,8 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
-	"github.com/hashicorp/terraform-plugin-sdk/terraform"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 // To run these acceptance tests, you will need access to a MySQL server.
@@ -26,24 +25,24 @@ import (
 // You can run the tests like this:
 //    make testacc TEST=./builtin/providers/mysql
 
-var testAccProviders map[string]terraform.ResourceProvider
+var testAccProviders map[string]*schema.Provider
 var testAccProvider *schema.Provider
 
 func init() {
-	testAccProvider = Provider().(*schema.Provider)
-	testAccProviders = map[string]terraform.ResourceProvider{
+	testAccProvider = Provider()
+	testAccProviders = map[string]*schema.Provider{
 		"mysql": testAccProvider,
 	}
 }
 
 func TestProvider(t *testing.T) {
-	if err := Provider().(*schema.Provider).InternalValidate(); err != nil {
+	if err := Provider().InternalValidate(); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 }
 
 func TestProvider_impl(t *testing.T) {
-	var _ terraform.ResourceProvider = Provider()
+	var _ *schema.Provider = Provider()
 }
 
 func testAccPreCheck(t *testing.T) {
@@ -53,7 +52,7 @@ func testAccPreCheck(t *testing.T) {
 		}
 	}
 
-	err := testAccProvider.Configure(terraform.NewResourceConfigRaw(nil))
+	err := testAccProvider.InternalValidate()
 	if err != nil {
 		t.Fatal(err)
 	}
