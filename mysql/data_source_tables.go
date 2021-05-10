@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -29,8 +30,8 @@ func dataSourceTables() *schema.Resource {
 	}
 }
 
-func ShowTables(d *schema.ResourceData, meta interface{}) error {
-	db, err := meta.(*MySQLConfiguration).GetDbConn()
+func ShowTables(ctx context.Context, d *schema.ResourceData, meta interface{}) error {
+	db, err := meta.(*MySQLConfiguration).GetDbConn(ctx)
 	if err != nil {
 		return err
 	}

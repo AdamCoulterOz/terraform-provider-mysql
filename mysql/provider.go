@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
@@ -36,9 +35,9 @@ type MySQLConfiguration struct {
 	db                  *sql.DB
 }
 
-func (c *MySQLConfiguration) GetDbConn() (*sql.DB, error) {
+func (c *MySQLConfiguration) GetDbConn(ctx context.Context) (*sql.DB, error) {
 	if c.db == nil {
-		db, err := connectToMySQL(c)
+		db, err := connectToMySQL(ctx, c)
 		if err != nil {
 			return nil, err
 		}
@@ -51,17 +50,10 @@ func Provider() *schema.Provider {
 	return &schema.Provider{
 		Schema: map[string]*schema.Schema{
 			"endpoint": {
-				Type:        schema.TypeString,
-				Required:    true,
-				DefaultFunc: schema.EnvDefaultFunc("MYSQL_ENDPOINT", nil),
-				ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-					value := v.(string)
-					if value == "" {
-						errors = append(errors, fmt.Errorf("endpoint must not be an empty string"))
-					}
-
-					return
-				},
+				Type:         schema.TypeString,
+				Required:     true,
+				DefaultFunc:  schema.EnvDefaultFunc("MYSQL_ENDPOINT", nil),
+				ValidateFunc: validation.StringIsNotEmpty,
 			},
 
 			"username": {
@@ -83,18 +75,14 @@ func Provider() *schema.Provider {
 					"ALL_PROXY",
 					"all_proxy",
 				}, nil),
-				ValidateFunc: validation.StringMatch(regexp.MustCompile(`^socks5h?://.*:\d+$`), "The proxy URL is not a valid socks url."),
+				ValidateFunc: validation.IsURLWithScheme([]string{"socks5"}),
 			},
 
 			"tls": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("MYSQL_TLS_CONFIG", "false"),
-				ValidateFunc: validation.StringInSlice([]string{
-					"true",
-					"false",
-					"skip-verify",
-				}, false),
+				Type:         schema.TypeString,
+				Optional:     true,
+				DefaultFunc:  schema.EnvDefaultFunc("MYSQL_TLS_CONFIG", "false"),
+				ValidateFunc: validation.StringInSlice([]string{"true", "false", "skip-verify"}, false),
 			},
 
 			"max_conn_lifetime_sec": {
@@ -111,20 +99,38 @@ func Provider() *schema.Provider {
 				Type:         schema.TypeString,
 				Optional:     true,
 				Default:      nativePasswords,
-				ValidateFunc: validation.StringInSlice([]string{cleartextPasswords, nativePasswords, aadAuthentication}, true),
+				ValidateFunc: validation.StringInSlice([]string{cleartextPasswords, nativePasswords, aadAuthentication}, false),
 			},
 
-			"aad_auth_client_id": {
-				Type:         schema.TypeString,
-				Optional:     true,
-				Description:  "Azure AD Client ID, required when using AAD Auth Plugin",
-				ValidateFunc: validation.StringIsNotEmpty,
-			},
-
-			"aad_auth_tenant_id": {
-				Type:        schema.TypeString,
+			"aad_authentication": {
+				Type:        schema.TypeSet,
 				Optional:    true,
-				Description: "Azure AD Client ID, required when using AAD Auth Plugin",
+				Description: "AAD Authentication Credentials block, required if using aad_auth plugin",
+				MaxItems:    1,
+				Elem: &schema.Provider{
+					Schema: map[string]*schema.Schema{
+
+						"client_id": {
+							Type:         schema.TypeString,
+							Required:     true,
+							Description:  "Azure AD Client ID",
+							ValidateFunc: validation.IsUUID,
+						},
+
+						"client_secret": {
+							Type:         schema.TypeString,
+							Required:     true,
+							ValidateFunc: validation.StringIsNotEmpty,
+						},
+
+						"tenant_id": {
+							Type:         schema.TypeString,
+							Required:     true,
+							Description:  "Azure AD Tenant ID",
+							ValidateFunc: validation.IsUUID,
+						},
+					},
+				},
 			},
 
 			"connect_retry_timeout_sec": {
@@ -203,17 +209,16 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 }
 
 func getAADToken(d *schema.ResourceData, password string) (token string, err error) {
-	clientId, exists := d.GetOk("aad_auth_client_id")
+	aadSet, exists := d.GetOk("aad_authentication")
 	if !exists {
-		err = fmt.Errorf("aad_auth_client_id is not set and is required when authentication_plugin is aad_auth")
+		err = fmt.Errorf("aad_authentication block is not set and is required when authentication_plugin is aad_auth")
 		return
 	}
-	tenantId, exists := d.GetOk("aad_auth_tenant_id")
-	if !exists {
-		err = fmt.Errorf("aad_auth_tenant_id is not set and is required when authentication_plugin is aad_auth")
-		return
-	}
-	clientCredentialsConfig := auth.NewClientCredentialsConfig(clientId.(string), password, tenantId.(string))
+	aadAuth := aadSet.(*schema.Set).List()[0].(*schema.ResourceData)
+	clientCredentialsConfig := auth.NewClientCredentialsConfig(
+		aadAuth.Get("client_id").(string),
+		aadAuth.Get("client_secret").(string),
+		aadAuth.Get("tenant_id").(string))
 	clientCredentialsConfig.AADEndpoint = "https://ossrdbms-aad.database.windows.net/.default"
 	aadToken, err := clientCredentialsConfig.ServicePrincipalToken()
 	if err != nil {
@@ -269,7 +274,7 @@ func serverVersionString(db *sql.DB) (string, error) {
 	return versionString, nil
 }
 
-func connectToMySQL(conf *MySQLConfiguration) (*sql.DB, error) {
+func connectToMySQL(ctx context.Context, conf *MySQLConfiguration) (*sql.DB, error) {
 
 	dsn := conf.Config.FormatDSN()
 	var db *sql.DB
@@ -279,7 +284,7 @@ func connectToMySQL(conf *MySQLConfiguration) (*sql.DB, error) {
 	// when Terraform thinks it's available and when it is actually available.
 	// This is particularly acute when provisioning a server and then immediately
 	// trying to provision a database on it.
-	retryError := resource.Retry(conf.ConnectRetryTimeout, func() *resource.RetryError {
+	retryError := resource.RetryContext(ctx, conf.ConnectRetryTimeout, func() *resource.RetryError {
 		db, err = sql.Open("mysql", dsn)
 		if err != nil {
 			return resource.RetryableError(err)

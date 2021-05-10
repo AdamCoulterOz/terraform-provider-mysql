@@ -57,7 +57,7 @@ func TestAccDatabase_collationChange(t *testing.T) {
 			},
 			{
 				PreConfig: func() {
-					db, err := connectToMySQL(testAccProvider.Meta().(*MySQLConfiguration))
+					db, err := connectToMySQL(ctx context.Context, testAccProvider.Meta().(*MySQLConfiguration))
 					if err != nil {
 						return
 					}
